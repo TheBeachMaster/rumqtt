@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 use std::time::Duration;
 use std::thread;
 use std::io::{self, ErrorKind};
@@ -52,7 +53,7 @@ impl Connection {
             let framed = match self.mqtt_connect() {
                 Ok(framed) => framed,
                 Err(e) => {
-                    error!("Connection error = {:?}", e);
+                    println!("Connection error = {:?}", e);
                     match reconnect_opts {
                         ReconnectOptions::Never => break 'reconnect,
                         ReconnectOptions::AfterFirstSuccess(d) if !initial_connect => {
@@ -173,21 +174,6 @@ impl Connection {
 
     /// Creates a mqtt connection on top of tcp/tls and returns a `Framed`
     fn mqtt_connect(&mut self) -> Result<Framed<TlsStream<TcpStream>, MqttCodec>, ConnectError> {
-        // NOTE: make sure that dns resolution happens during reconnection to handle changes in server ip
-        let addrs: Vec<SocketAddr> = self.opts.broker_addr.as_ref().to_socket_addrs::<SocketAddr>()?.collect();
-        let addr = match addrs.get(0) {
-            Some(a) => a,
-            None => {
-                error!("Dns resolve array empty");
-                return Err(ConnectError::DnsListEmpty)
-            }
-        };
-        
-        let handle = self.reactor.handle();
-        let mqtt_state = self.mqtt_state.clone();
-        
-        // TODO: Add TLS support with client authentication (ca = roots.pem for iotcore)
-
         let stream = self.mqtt_tls_connect();
 
         let response = self.reactor.run(stream);
@@ -224,7 +210,25 @@ impl Connection {
     // }
 
     pub fn mqtt_tls_connect(&self) -> Box<Future<Item=(Option<Packet>, Framed<TlsStream<TcpStream>, MqttCodec>),  Error=io::Error>> {
-        let addr: SocketAddr = self.opts.broker_addr.as_str().parse().unwrap();
+        let addr = self.opts.broker_addr.clone();
+        let domain = addr.split(":")
+                         .map(str::to_string)
+                         .next()
+                         .unwrap_or_default();
+
+        let mut addrs: Vec<_> = addr.to_socket_addrs().unwrap().collect();
+        let addr = addrs.pop();
+        let addr = match addr {
+            Some(a) => a,
+            None => {
+                error!("Dns resolve array empty");
+                return Box::new(future::err(io::Error::new(ErrorKind::AddrNotAvailable, "Dns resolution falied. Empty list")))
+            }
+        };
+
+        println!("{:?}", addr);
+
+        
         let handle = self.reactor.handle();
         // let security = self.opts.security;
         let mqtt_state = self.mqtt_state.clone();
@@ -236,7 +240,9 @@ impl Connection {
             cx.add_root_certificate(ca).unwrap();
             let cx = cx.build().unwrap();
 
-            let tls = cx.connect_async(&*format!("{}", &addr.ip()), socket);
+            let ip = &*format!("{}", &addr.ip());
+            println!("{:?}", ip);
+            let tls = cx.connect_async(&domain, socket);
             tls.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
         });
 
@@ -244,6 +250,7 @@ impl Connection {
         let mqtt_request = tls_handshake.and_then(move |connection| {
             let framed = connection.framed(MqttCodec);
             let connect = mqtt_state.borrow_mut().handle_outgoing_connect();
+            println!("{:?}",  connect);
             framed.send(Packet::Connect(connect))
         });
 
@@ -256,6 +263,6 @@ impl Connection {
     }
 
     fn get_ca_certificate(&self) -> Certificate {
-        Certificate::from_der(include_bytes!("/userdata/certs/roots.der")).unwrap()
+        Certificate::from_der(include_bytes!("/Users/raviteja/certs/roots.der")).unwrap()
     }
 }
