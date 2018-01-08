@@ -15,10 +15,14 @@ use tokio_core::net::TcpStream;
 use tokio_io::AsyncRead;
 use tokio_io::codec::Framed;
 
+use native_tls::TlsConnector;
+use native_tls::Certificate;
+use tokio_tls::{TlsConnectorExt, TlsStream};
+
 use mqtt3::Packet;
 
 use error::ConnectError;
-use mqttopts::{MqttOptions, ReconnectOptions};
+use mqttopts::{MqttOptions, ReconnectOptions, SecurityOptions};
 use client::state::MqttState;
 use codec::MqttCodec;
 use crossbeam_channel;
@@ -109,7 +113,7 @@ impl Connection {
     //  TODO: Remove box when `impl Future` is stable
     //  NOTE: Uses `unbounded` channel for sending notifications back to network as bounded
     //        channel clone will double the size of the queue anyway.
-    fn mqtt_network_recv_future(&self, receiver: SplitStream<Framed<TcpStream, MqttCodec>>, network_reply_tx: UnboundedSender<Packet>) -> Box<Future<Item=(), Error=io::Error>> {
+    fn mqtt_network_recv_future(&self, receiver: SplitStream<Framed<TlsStream<TcpStream>, MqttCodec>>, network_reply_tx: UnboundedSender<Packet>) -> Box<Future<Item=(), Error=io::Error>> {
         let mqtt_state = self.mqtt_state.clone();
         let notifier = self.notifier_tx.clone();
         
@@ -168,25 +172,25 @@ impl Connection {
 
 
     /// Creates a mqtt connection on top of tcp/tls and returns a `Framed`
-    fn mqtt_connect(&mut self) -> Result<Framed<TcpStream, MqttCodec>, ConnectError> {
+    fn mqtt_connect(&mut self) -> Result<Framed<TlsStream<TcpStream>, MqttCodec>, ConnectError> {
         // NOTE: make sure that dns resolution happens during reconnection to handle changes in server ip
-        let addr: SocketAddr = self.opts.broker_addr.as_str().parse().unwrap();
+        let addrs: Vec<SocketAddr> = self.opts.broker_addr.as_ref().to_socket_addrs::<SocketAddr>()?.collect();
+        let addr = match addrs.get(0) {
+            Some(a) => a,
+            None => {
+                error!("Dns resolve array empty");
+                return Err(ConnectError::DnsListEmpty)
+            }
+        };
+        
         let handle = self.reactor.handle();
         let mqtt_state = self.mqtt_state.clone();
         
         // TODO: Add TLS support with client authentication (ca = roots.pem for iotcore)
 
-        let future_response = TcpStream::connect(&addr, &handle).and_then(|connection| {
-            let framed = connection.framed(MqttCodec);
-            let connect = mqtt_state.borrow_mut().handle_outgoing_connect();
-            let future_mqtt_connect = framed.send(Packet::Connect(connect));
+        let stream = self.mqtt_tls_connect();
 
-            future_mqtt_connect.and_then(|framed| {
-                framed.into_future().and_then(|(res, stream)| Ok((res, stream))).map_err(|(err, _stream)| err)
-            })
-        });
-
-        let response = self.reactor.run(future_response);
+        let response = self.reactor.run(stream);
         let (packet, frame) = response?;
 
         // Return `Framed` and previous session packets that are to be republished
@@ -197,5 +201,61 @@ impl Connection {
             }
             _ => unimplemented!(),
         }
+    }
+
+    // pub fn tcp_stream_future(&self) -> Box<Future<Item=(Option<Packet>, Framed<TcpStream, MqttCodec>), Error=io::Error>> {
+    //     let addr: SocketAddr = self.opts.broker_addr.as_str().parse().unwrap();
+    //     let handle = self.reactor.handle();
+    //     let mqtt_state = self.mqtt_state.clone();
+    //     let security = self.opts.security;
+
+    //     let future_response = TcpStream::connect(&addr, &handle).and_then(move |connection| {
+    //         let framed = connection.framed(MqttCodec);
+    //         // let connect = mqtt_state.borrow_mut().handle_outgoing_connect();
+    //         // let future_mqtt_connect = framed.send(Packet::Connect(connect));
+
+    //         // future_mqtt_connect.and_then(|framed| {
+    //         //     framed.into_future().and_then(|(res, stream)| Ok((res, stream))).map_err(|(err, _stream)| err)
+    //         // })
+    //         framed
+    //     });
+
+    //     Box::new(future_response)
+    // }
+
+    pub fn mqtt_tls_connect(&self) -> Box<Future<Item=(Option<Packet>, Framed<TlsStream<TcpStream>, MqttCodec>),  Error=io::Error>> {
+        let addr: SocketAddr = self.opts.broker_addr.as_str().parse().unwrap();
+        let handle = self.reactor.handle();
+        // let security = self.opts.security;
+        let mqtt_state = self.mqtt_state.clone();
+        let socket = TcpStream::connect(&addr, &handle);
+        let ca = self.get_ca_certificate();
+
+        let tls_handshake = socket.and_then(move |socket| {
+            let mut cx = TlsConnector::builder().unwrap();
+            cx.add_root_certificate(ca).unwrap();
+            let cx = cx.build().unwrap();
+
+            let tls = cx.connect_async(&*format!("{}", &addr.ip()), socket);
+            tls.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        });
+
+        // mqtt connection to network
+        let mqtt_request = tls_handshake.and_then(move |connection| {
+            let framed = connection.framed(MqttCodec);
+            let connect = mqtt_state.borrow_mut().handle_outgoing_connect();
+            framed.send(Packet::Connect(connect))
+        });
+
+        // network reponse
+        let mqtt_response = mqtt_request.and_then(|framed| {
+            framed.into_future().and_then(|(res, stream)| Ok((res, stream))).map_err(|(err, _stream)| err)
+        });
+
+        Box::new(mqtt_response)
+    }
+
+    fn get_ca_certificate(&self) -> Certificate {
+        Certificate::from_der(include_bytes!("/userdata/certs/roots.der")).unwrap()
     }
 }

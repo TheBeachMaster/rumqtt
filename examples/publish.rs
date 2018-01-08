@@ -8,7 +8,7 @@ use rumqtt::{MqttOptions, ReconnectOptions, MqttClient, QoS};
 
 fn main() {
     loggerv::init_with_verbosity(1).unwrap();
-    let mqtt_opts = MqttOptions::new("rumqtt-core", "127.0.0.1:1883").unwrap()
+    let mqtt_opts = MqttOptions::new("projects/crested-return-122311/locations/us-central1/registries/iotcore-dev/devices/RAVI-LINUX", "mqtt.googleapis.com:8883").unwrap()
                                 .set_reconnect_opts(ReconnectOptions::Always(10));
     
 

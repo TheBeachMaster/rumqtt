@@ -41,7 +41,9 @@ pub enum ConnectError {
     #[fail(display = "Mqtt connection failed. Error = {}", _0)]
     MqttConnectionRefused(u8),
     #[fail(display = "Io failed. Error = {}", _0)]
-    Io(IoError)
+    Io(IoError),
+    #[fail(display = "Empty dns list")]
+    DnsListEmpty
 }
 
 #[derive(Debug, Fail, PartialEq)]
