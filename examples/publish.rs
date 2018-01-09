@@ -22,11 +22,11 @@ fn main() {
         }
     });
 
-    for i in 0..1000 {
+    for i in 0..100 {
         if let Err(e) = client.publish("/devices/RAVI-MAC/events/imu", QoS::AtLeastOnce, vec![1, 2, 3]) {
             println!("{:?}", e);
         }
-        thread::sleep(Duration::new(1, 0));
+        // thread::sleep(Duration::new(1, 0));
     }
     
 

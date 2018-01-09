@@ -175,56 +175,15 @@ impl Connection {
         }
     }
 
-    // pub fn mqtt_connect(&mut self) -> Result<Framed<NetworkStream, MqttCodec>, ConnectError> {
-    //     let addr = self.opts.broker_addr.clone();
-    //     let domain = addr.split(":")
-    //                      .map(str::to_string)
-    //                      .next()
-    //                      .unwrap_or_default();
-
-        
-    //     let mqtt_state = self.mqtt_state.clone();
-    //     let ca = self.get_ca_certificate();
-
-    //     let stream = self.create_network_stream()?;
-    //     let framed = stream.framed(MqttCodec);
-    //     let connect = mqtt_state.borrow_mut().handle_outgoing_connect();
-
-    //     let framed = framed.send(Packet::Connect(connect)).wait()?;  
-    //     Ok(framed)
-    // }
-
-    fn mqtt_connect(&mut self) -> Result<Framed<NetworkStream, MqttCodec>, ConnectError> {
-        let mqtt_state = self.mqtt_state.clone();
-        let (addr, domain) = self.get_socket_address()?;
-        let security = self.opts.security.clone();
-        let ca = self.get_ca_certificate();
-
-        let handle = self.reactor.handle();
-        
-        let tcp_future = TcpStream::connect(&addr, &handle).map(|tcp| {
-            tcp
-        });
-
-        let tls_future = tcp_future.and_then(move |tcp| {
-            let mut cx = TlsConnector::builder().unwrap();
-            cx.add_root_certificate(ca).unwrap();
-            let cx = cx.build().unwrap();
-            
-            let tls = cx.connect_async(&domain, tcp);
-            tls.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-        });
-
-        let network_future = tls_future.map(move |connection| {
-            NetworkStream::Tls(connection)
-        });
-
-        let stream = self.reactor.run(network_future)?;
+    pub fn mqtt_connect(&mut self) -> Result<Framed<NetworkStream, MqttCodec>, ConnectError> {
+        let stream = self.create_network_stream()?;
         let framed = stream.framed(MqttCodec);
-        let connect = mqtt_state.borrow_mut().handle_outgoing_connect();
+        let connect = self.mqtt_state.borrow_mut().handle_outgoing_connect();
 
-        let framed = framed.send(Packet::Connect(connect)).wait()?;
-        let (packet, framed) = self.reactor.run(framed.into_future().map_err(|(err, _stream)| err))?;
+        let framed = framed.send(Packet::Connect(connect)).and_then(|framed| {
+            framed.into_future().and_then(|(res, stream)| Ok((res, stream))).map_err(|(err, _stream)| err)
+        });
+        let (packet, framed) = self.reactor.run(framed)?;
         
         match packet.unwrap() {
             Packet::Connack(connack) => {
@@ -232,7 +191,42 @@ impl Connection {
                 Ok(framed)
             }
             _ => unimplemented!(),
-        }
+        } 
+    }
+
+    fn create_network_stream(&mut self) -> Result<NetworkStream, ConnectError> {
+        let (addr, domain) = self.get_socket_address()?;
+        let security = self.opts.security.clone();
+        let handle = self.reactor.handle();
+
+        let tcp_future = TcpStream::connect(&addr, &handle).map(|tcp| {
+            tcp
+        });
+
+        let network_stream = match security {
+            SecurityOptions::None => {
+                let network_future = tcp_future.map(move |connection| NetworkStream::Tcp(connection));
+                self.reactor.run(network_future)?
+            }
+            SecurityOptions::GcloudIotCore((ca, _, _)) => {
+                let ca = self.get_ca_certificate();
+
+                let tls_future = tcp_future.and_then(|tcp| {
+                    let mut cx = TlsConnector::builder().unwrap();
+                    cx.add_root_certificate(ca).unwrap();
+                    let cx = cx.build().unwrap();
+
+                    let tls = cx.connect_async(&domain, tcp);
+                    tls.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                });
+
+                let network_future = tls_future.map(move |connection| NetworkStream::Tls(connection));
+                self.reactor.run(network_future)?
+            }
+            _ => unimplemented!()
+        };
+
+        Ok(network_stream)
     }
 
     fn get_socket_address(&self) -> Result<(SocketAddr, String), ConnectError> {
