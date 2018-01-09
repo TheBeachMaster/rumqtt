@@ -1,4 +1,5 @@
 mod state;
+mod network;
 mod connection;
 
 use std::thread;

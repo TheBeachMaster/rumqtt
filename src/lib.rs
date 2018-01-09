@@ -10,6 +10,8 @@ extern crate jsonwebtoken as jwt;
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
+extern crate derive_more;
+#[macro_use]
 extern crate log;
 extern crate crossbeam_channel;
 extern crate native_tls;
