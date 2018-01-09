@@ -1,43 +1,13 @@
-use std::net::SocketAddr;
-use std::io::{self, Read, Write, ErrorKind};
+use std::io::{self, Read, Write};
 
 use tokio_core::net::TcpStream;
-use tokio_core::reactor::Core;
-use native_tls::TlsConnector;
-use native_tls::Certificate;
-use tokio_tls::{TlsConnectorExt, TlsStream};
+use tokio_tls::TlsStream;
 use tokio_io::{AsyncRead, AsyncWrite};
-use futures::{Future, Poll};
-
-use error::ConnectError;
+use futures::Poll;
 
 pub enum NetworkStream {
     Tcp(TcpStream),
     Tls(TlsStream<TcpStream>)
-}
-
-impl NetworkStream {
-    pub fn new(addr: &SocketAddr, reactor: &mut Core) -> Result<NetworkStream, ConnectError> {
-        let tcp = TcpStream::connect(&addr, &reactor.handle());
-        let tcp = reactor.run(tcp)?;
-        Ok(NetworkStream::Tcp(tcp))
-    }
-
-    pub fn tls(self, ca: Certificate, domain: &str, reactor: &mut Core) -> Result<NetworkStream, ConnectError> {
-        let mut cx = TlsConnector::builder()?;
-        cx.add_root_certificate(ca)?;
-        let cx = cx.build()?;
-
-        let tls = match self {
-            NetworkStream::Tcp(tcp) => {
-                let tls = cx.connect_async(domain, tcp);
-                reactor.run(tls)?
-            }
-            NetworkStream::Tls(_tls) => return Err(io::Error::new(ErrorKind::AlreadyExists, "This is already a tls stream").into()),
-        };
-
-        Ok(NetworkStream::Tls(tls))
-    }
 }
 
 impl Read for NetworkStream {

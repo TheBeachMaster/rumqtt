@@ -37,8 +37,10 @@ impl MqttClient {
 
         thread::spawn( move || {
                 let mut connection = connection::Connection::new(opts, notifier_tx);
-                connection.start(commands_rx);
-                error!("Network Thread Stopped !!!!!!!!!");
+                match connection.start(commands_rx) {
+                    Ok(()) => error!("Network Thread Stopped !!!!!!!!!"),
+                    Err(e) => error!("Network thread exited. Error = {:?}", e)
+                };
             }
         );
 

@@ -7,7 +7,7 @@ use std::thread;
 use std::io::{self, ErrorKind};
 
 use futures::{future, Future, Sink};
-use futures::stream::{Stream, SplitStream};
+use futures::stream::{self, Stream, SplitStream};
 use futures::sync::mpsc::Receiver;
 use futures::unsync;
 use futures::unsync::mpsc::UnboundedSender;
@@ -17,7 +17,7 @@ use tokio_io::AsyncRead;
 use tokio_io::codec::Framed;
 
 use native_tls::{TlsConnector, Certificate};
-use tokio_tls::{TlsConnectorExt, TlsStream};
+use tokio_tls::TlsConnectorExt;
 
 use mqtt3::Packet;
 
@@ -28,8 +28,8 @@ use client::network::NetworkStream;
 use codec::MqttCodec;
 use crossbeam_channel;
 
-// DEVELOPMENT NOTES: Don't use `wait` in eventloop thread even if you
-//                    are ok with blocking code. It might cause deadlock
+// DEVELOPER NOTES: Don't use `wait` in eventloop thread even if you
+//                  are ok with blocking code. It might cause deadlock
 // https://github.com/tokio-rs/tokio-core/issues/182 
 
 pub struct Connection {
@@ -45,11 +45,14 @@ impl Connection {
             notifier_tx: notifier_tx,
             mqtt_state: Rc::new(RefCell::new(MqttState::new(opts.clone()))),
             opts: opts,
-            reactor: Core::new().unwrap()
+            reactor: Core::new().expect("Unable to create new reactor")
         }
     }
 
-    pub fn start(&mut self, mut commands_rx: Receiver<Packet>) {
+    // TODO: This method is too big. Passing rx as reference to a method to create
+    //       network sender future is not ergonomic. Check other ways of reusing rx
+    //       in the loop and creating a sender future
+    pub fn start(&mut self, mut commands_rx: Receiver<Packet>) -> Result<(), io::Error> {
         let initial_connect = self.mqtt_state.borrow().initial_connect();
         let reconnect_opts = self.opts.reconnect;
 
@@ -75,42 +78,46 @@ impl Connection {
                 }
             };
 
+            let framed = match self.republish_unacked(framed) {
+                Ok(framed) => framed,
+                Err(e) => {
+                    error!("Republish error = {:?}", e);
+                    continue 'reconnect;
+                }
+            };
+
             let (network_reply_tx, mut network_reply_rx) = unsync::mpsc::unbounded::<Packet>();
 
-            let (mut sender, receiver) = framed.split();
+            let (sender, receiver) = framed.split();
             let mqtt_recv = self.mqtt_network_recv_future(receiver, network_reply_tx.clone());
             let ping_timer = self.ping_timer_future(network_reply_tx.clone());
-
-            // republish last session unacked packets
-            // NOTE: this will block eventloop until last session publishs are written to network
-            // TODO: verify for duplicates here
-            let last_session_publishes = self.mqtt_state.borrow_mut().handle_reconnection();
-            if let Some(publishes) = last_session_publishes {
-                for publish in publishes{
-                    let packet = Packet::Publish(publish);
-                    sender = sender.send(packet).wait().unwrap();
-                }
-            }
 
             // receive incoming user request and write to network
             let mqtt_state = self.mqtt_state.clone();
             let commands_rx = commands_rx.by_ref();
             let network_reply_rx = network_reply_rx.by_ref();
 
-            let mqtt_send = commands_rx.select(network_reply_rx)
-            .map(move |msg| {
-                mqtt_state.borrow_mut().handle_outgoing_mqtt_packet(msg).unwrap()
-            }).map_err(|_| io::Error::new(ErrorKind::Other, "Error receiving client msg"))
-              .forward(sender)
-              .map(|_| ())
-              .or_else(|_| { error!("Client send error"); future::ok(())});
+            let mqtt_send = commands_rx
+                                .select(network_reply_rx)
+                                .map_err(|_| io::Error::new(ErrorKind::Other, "Error receiving outgoing msg"))
+                                .and_then(move |msg| {
+                                    match mqtt_state.borrow_mut().handle_outgoing_mqtt_packet(msg) {
+                                        Ok(packet) => future::ok(packet),
+                                        Err(e) => {
+                                            error!("Handling outgoing packet failed. Error = {:?}", e);
+                                            future::err(io::Error::new(ErrorKind::Other, "Error handling outgoing"))
+                                        }
+                                    }
+                                 }).forward(sender)
+                                   .map(|_| ())
+                                   .or_else(|_| { error!("Client send error"); future::ok(())});
 
             // join all the futures and run the reactor
             let mqtt_send_and_recv = mqtt_recv.join3(mqtt_send, ping_timer);
-            if let Err(err) = self.reactor.run(mqtt_send_and_recv) {
-                error!("Reactor halted. Error = {:?}", err);
-            }
+            self.reactor.run(mqtt_send_and_recv)?;
         }
+
+        Ok(())
     }
 
 
@@ -175,6 +182,26 @@ impl Connection {
         }
     }
 
+    pub fn republish_unacked(&mut self, framed: Framed<NetworkStream, MqttCodec>) -> Result<Framed<NetworkStream, MqttCodec>, ConnectError> {
+        // republish last session unacked packets
+        // NOTE: this will block eventloop until last session publishs are written to network
+        // TODO: verify for duplicates here
+        let last_session_publishes = self.mqtt_state.borrow_mut().handle_reconnection();
+        match last_session_publishes {
+            Some(publishes) => {
+                let publishes = stream::iter_ok::<_, io::Error>(publishes);
+                let publish_forward_future = publishes.and_then(|publish| {
+                    let publish = Packet::Publish(publish);
+                    Ok(publish)
+                }).forward(framed);
+
+                let (_, framed) = self.reactor.run(publish_forward_future)?;
+                Ok(framed)
+            }
+            None => Ok(framed)
+        }
+    }
+
     pub fn mqtt_connect(&mut self) -> Result<Framed<NetworkStream, MqttCodec>, ConnectError> {
         let stream = self.create_network_stream()?;
         let framed = stream.framed(MqttCodec);
@@ -185,7 +212,7 @@ impl Connection {
         });
         let (packet, framed) = self.reactor.run(framed)?;
         
-        match packet.unwrap() {
+        match packet.expect("Expected connack packet") {
             Packet::Connack(connack) => {
                 self.mqtt_state.borrow_mut().handle_incoming_connack(connack)?;
                 Ok(framed)
@@ -210,12 +237,11 @@ impl Connection {
             }
             SecurityOptions::GcloudIotCore((ca, _, _)) => {
                 let ca = self.get_ca_certificate();
+                let mut cx = TlsConnector::builder()?;
+                cx.add_root_certificate(ca)?;
+                let cx = cx.build()?;
 
                 let tls_future = tcp_future.and_then(|tcp| {
-                    let mut cx = TlsConnector::builder().unwrap();
-                    cx.add_root_certificate(ca).unwrap();
-                    let cx = cx.build().unwrap();
-
                     let tls = cx.connect_async(&domain, tcp);
                     tls.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
                 });
@@ -235,7 +261,7 @@ impl Connection {
                          .map(str::to_string)
                          .next()
                          .unwrap_or_default();
-        let mut addrs: Vec<_> = addr.to_socket_addrs().unwrap().collect();
+        let mut addrs: Vec<_> = addr.to_socket_addrs()?.collect();
         let addr = addrs.pop();
         
         match addr {
