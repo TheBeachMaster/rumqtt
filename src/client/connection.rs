@@ -60,17 +60,17 @@ impl Connection {
             let framed = match self.mqtt_connect() {
                 Ok(framed) => framed,
                 Err(e) => {
-                    println!("Connection error = {:?}", e);
+                    error!("Connection error = {:?}", e);
                     match reconnect_opts {
                         ReconnectOptions::Never => break 'reconnect,
                         ReconnectOptions::AfterFirstSuccess(d) if !initial_connect => {
-                            info!("Will retry connecting again in {} seconds", d);
+                            error!("Will retry connecting again in {} seconds", d);
                             thread::sleep(Duration::new(u64::from(d), 0));
                             continue 'reconnect;
                         }
                         ReconnectOptions::AfterFirstSuccess(_) => break 'reconnect,
                         ReconnectOptions::Always(d) => {
-                            info!("Will retry connecting again in {} seconds", d);
+                            error!("Will retry connecting again in {} seconds", d);
                             thread::sleep(Duration::new(u64::from(d), 0));
                             continue 'reconnect;
                         }
@@ -99,8 +99,11 @@ impl Connection {
 
             let mqtt_send = commands_rx
                                 .select(network_reply_rx)
-                                .map_err(|_| io::Error::new(ErrorKind::Other, "Error receiving outgoing msg"))
+                                .map_err(|_| {
+                                    io::Error::new(ErrorKind::Other, "Error receiving outgoing msg")
+                                    })
                                 .and_then(move |msg| {
+                                    println!("Packet recv {:?}", msg);
                                     match mqtt_state.borrow_mut().handle_outgoing_mqtt_packet(msg) {
                                         Ok(packet) => future::ok(packet),
                                         Err(e) => {
@@ -113,8 +116,23 @@ impl Connection {
                                    .or_else(|_| { error!("Client send error"); future::ok(())});
 
             // join all the futures and run the reactor
-            let mqtt_send_and_recv = mqtt_recv.join3(mqtt_send, ping_timer);
-            self.reactor.run(mqtt_send_and_recv)?;
+            let client_future_with_pings = mqtt_send.join(ping_timer).map(|_|{ 
+                println!("Client send");
+                ()
+            });
+
+            let mqtt_send_and_recv = mqtt_recv.select(client_future_with_pings).map_err(|_| {
+                println!("Select");
+                io::Error::new(ErrorKind::Other, "Error handling outgoing")
+            });
+           
+           
+            match self.reactor.run(mqtt_send_and_recv) {
+                Ok(e) => {},
+                Err(e) => {}
+            }
+            // self.reactor.run(mqtt_send_and_recv)?;
+            // println!("Attempting connection");
         }
 
         Ok(())
@@ -128,8 +146,10 @@ impl Connection {
     fn mqtt_network_recv_future(&self, receiver: SplitStream<Framed<NetworkStream, MqttCodec>>, network_reply_tx: UnboundedSender<Packet>) -> Box<Future<Item=(), Error=io::Error>> {
         let mqtt_state = self.mqtt_state.clone();
         let notifier = self.notifier_tx.clone();
+        println!("skjfse");
         
         let receiver = receiver.for_each(move |packet| {
+            println!("Inside foreach");
             let (notification, reply) = match mqtt_state.borrow_mut().handle_incoming_mqtt_packet(packet) {
                 Ok((notification, reply)) => (notification, reply),
                 Err(e) => {
@@ -150,7 +170,7 @@ impl Connection {
             if let Some(reply) = reply {
                 let s = network_reply_tx.send(reply).map(|_| ()).map_err(|_| io::Error::new(ErrorKind::Other, "Error receiving client msg"));
                 Box::new(s) as Box<Future<Item=(), Error=io::Error>>
-            } else {
+            } else { 
                 Box::new(future::ok(()))
             }
         });
@@ -249,6 +269,19 @@ impl Connection {
                 let network_future = tls_future.map(move |connection| NetworkStream::Tls(connection));
                 self.reactor.run(network_future)?
             }
+            SecurityOptions::Tls((ca, client_cert, client_key)) => {
+                let ca = self.get_ca_certificate();
+                let mut cx = TlsConnector::builder()?;
+                cx.add_root_certificate(ca)?;
+                let cx = cx.build()?;
+                let tls_future = tcp_future.and_then(|tcp| {
+                    let tls = cx.connect_async(&domain, tcp);
+                    tls.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                });
+
+                let network_future = tls_future.map(move |connection| NetworkStream::Tls(connection));
+                self.reactor.run(network_future)?
+            }
             _ => unimplemented!()
         };
 
@@ -271,6 +304,6 @@ impl Connection {
     }
 
     fn get_ca_certificate(&self) -> Certificate {
-        Certificate::from_der(include_bytes!("/Users/raviteja/certs/roots.der")).unwrap()
+        Certificate::from_der(include_bytes!("ca.der")).unwrap()
     }
 }

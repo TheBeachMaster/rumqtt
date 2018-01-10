@@ -8,7 +8,7 @@ use rumqtt::{MqttOptions, ReconnectOptions, MqttClient, QoS};
 
 fn main() {
     loggerv::init_with_verbosity(1).unwrap();
-    let mqtt_opts = MqttOptions::new("rumqtt-core", "test.mosquitto.org:1883").unwrap()
+    let mqtt_opts = MqttOptions::new("rumqtt-core", "test.mosquitto.org:8889").unwrap()
 
                                 .set_reconnect_opts(ReconnectOptions::AfterFirstSuccess(10));
 

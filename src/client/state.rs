@@ -319,7 +319,6 @@ impl MqttState {
     // }
 
     pub fn handle_disconnect(&mut self) {
-        println!("Handling disconnect");
         self.await_pingresp = false;
         self.connection_status = MqttConnectionStatus::Disconnected;
 
