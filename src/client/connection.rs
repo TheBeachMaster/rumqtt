@@ -64,13 +64,13 @@ impl Connection {
                     match reconnect_opts {
                         ReconnectOptions::Never => break 'reconnect,
                         ReconnectOptions::AfterFirstSuccess(d) if !initial_connect => {
-                            error!("Will retry connecting again in {} seconds", d);
+                            info!("Will retry connecting again in {} seconds", d);
                             thread::sleep(Duration::new(u64::from(d), 0));
                             continue 'reconnect;
                         }
                         ReconnectOptions::AfterFirstSuccess(_) => break 'reconnect,
                         ReconnectOptions::Always(d) => {
-                            error!("Will retry connecting again in {} seconds", d);
+                            info!("Will retry connecting again in {} seconds", d);
                             thread::sleep(Duration::new(u64::from(d), 0));
                             continue 'reconnect;
                         }
@@ -120,19 +120,13 @@ impl Connection {
                 println!("Client send");
                 ()
             });
-
-            let mqtt_send_and_recv = mqtt_recv.select(client_future_with_pings).map_err(|_| {
-                println!("Select");
-                io::Error::new(ErrorKind::Other, "Error handling outgoing")
-            });
-           
-           
+            let mqtt_send_and_recv = mqtt_recv.select(client_future_with_pings).map_err(|_| io::Error::new(ErrorKind::Other, "Error handling outgoing"));
             match self.reactor.run(mqtt_send_and_recv) {
                 Ok(e) => {},
                 Err(e) => {}
             }
             // self.reactor.run(mqtt_send_and_recv)?;
-            // println!("Attempting connection");
+            println!("Attempting connection");
         }
 
         Ok(())
@@ -146,7 +140,7 @@ impl Connection {
     fn mqtt_network_recv_future(&self, receiver: SplitStream<Framed<NetworkStream, MqttCodec>>, network_reply_tx: UnboundedSender<Packet>) -> Box<Future<Item=(), Error=io::Error>> {
         let mqtt_state = self.mqtt_state.clone();
         let notifier = self.notifier_tx.clone();
-        println!("skjfse");
+        println!();
         
         let receiver = receiver.for_each(move |packet| {
             println!("Inside foreach");
@@ -304,6 +298,6 @@ impl Connection {
     }
 
     fn get_ca_certificate(&self) -> Certificate {
-        Certificate::from_der(include_bytes!("ca.der")).unwrap()
+        Certificate::from_der(include_bytes!("/home/rahulsharma/certs/ca.der")).unwrap()
     }
 }
